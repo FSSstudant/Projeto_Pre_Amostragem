@@ -2,6 +2,7 @@ import streamlit as st
 import datetime
 import pandas as pd
 from database import (
+    criar_tabelas,
     cadastrar_cliente, 
     listar_clientes, 
     criar_ordem_servico,
