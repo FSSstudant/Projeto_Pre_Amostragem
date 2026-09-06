@@ -15,7 +15,7 @@ from database import (
     gerar_pdf_plano_amostragem,
     gerar_excel_ordem_servico
 )
-
+criar_tabelas()
 st.set_page_config(page_title="Gestão de Pré-Amostragem", layout="wide")
 
 st.title(" Sistema de Gestão de Pré-Amostragem Ambiental")
