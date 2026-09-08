@@ -13,8 +13,24 @@ from database import (
     atualizar_ponto_amostra,
     gerar_pdf_cadeia_custodia,
     gerar_pdf_plano_amostragem,
-    gerar_excel_ordem_servico
+    gerar_excel_ordem_servico,
+    atualizar_status_os
 )
+import re
+
+def validar_e_formatar_documento(doc):
+    """Remove caracteres não numéricos e aplica máscara de CPF ou CNPJ."""
+    numeros = re.sub(r'\D', '', doc)
+    
+    if len(numeros) == 11:
+        # Formata como CPF: 000.000.000-00
+        return f"{numeros[:3]}.{numeros[3:6]}.{numeros[6:9]}-{numeros[9:]}"
+    elif len(numeros) == 14:
+        # Formata como CNPJ: 00.000.000/0000-00
+        return f"{numeros[:2]}.{numeros[2:5]}.{numeros[5:8]}/{numeros[8:12]}-{numeros[12:]}"
+    else:
+        return None # Retorna None se o tamanho for inválido
+    
 criar_tabelas()
 st.set_page_config(page_title="Gestão de Pré-Amostragem", layout="wide")
 
@@ -70,13 +86,19 @@ with aba1:
         
         if btn_salvar_cliente:
             if razao_social and cnpj and endereco and contato:
-                sucesso = cadastrar_cliente(razao_social, cnpj, endereco, contato)
-                if sucesso:
-                    st.success(f"Cliente '{razao_social}' cadastrado com sucesso!")
+                # Chama a validação e formatação
+                cnpj_cpf_formatado = validar_e_formatar_documento(cnpj)
+                
+                if not cnpj_cpf_formatado:
+                    st.error("❌ CNPJ ou CPF inválido! Digite 11 dígitos para CPF ou 14 para CNPJ.")
                 else:
-                    st.error("Erro: Já existe um cliente cadastrado com este CNPJ/CPF.")
+                    sucesso = cadastrar_cliente(razao_social, cnpj_cpf_formatado, endereco, contato)
+                    if sucesso:
+                        st.success(f"✅ Cliente '{razao_social}' cadastrado com sucesso! (Doc: {cnpj_cpf_formatado})")
+                    else:
+                        st.error("❌ Erro: Já existe um cliente cadastrado com este CNPJ/CPF.")
             else:
-                st.warning("Por favor, preencha todos os campos obrigatórios (*).")
+                st.warning("⚠️ Por favor, preencha todos os campos obrigatórios (*).")
 
 # ==========================================
 # ABA 2: ABERTURA DE ORDEM DE SERVIÇO (OS)
@@ -135,9 +157,32 @@ with aba3:
     if not ordens:
         st.warning("Nenhuma Ordem de Serviço cadastrada. Cadastre uma OS na Aba 2 primeiro.")
     else:
-        opcoes_os = {f"OS nº {o[0]} - {o[1]} (Solicitada em: {o[2]})": o[0] for o in ordens}
+        opcoes_os = {f"OS nº {o[0]} - {o[1]} [{o[3]}]": o[0] for o in ordens}
         os_selecionada = st.selectbox("Selecione a Ordem de Serviço para configurar:", list(opcoes_os.keys()))
         id_os_selecionada = opcoes_os[os_selecionada]
+        os_atual = next(o for o in ordens if o[0] == id_os_selecionada)
+        status_atual = os_atual[3]
+        if status_atual == "Concluída":
+            st.success(f"**Status Atual:** {status_atual} ✅")
+        elif status_atual == "Em Planejamento":
+            st.warning(f"**Status Atual:** {status_atual} 🚧")
+        else:
+            st.error(f"**Status Atual:** {status_atual} ❌")
+
+        with st.expander("🔄 Alterar Status da OS"):
+            col_status, col_btn_status = st.columns([3, 1])
+            with col_status:
+                lista_status = ["Em Planejamento", "Concluída", "Cancelada"]
+                # Pega o índice do status atual para deixá-lo selecionado por padrão
+                idx_atual = lista_status.index(status_atual) if status_atual in lista_status else 0
+                novo_status = st.selectbox("Definir novo status para esta OS:", lista_status, index=idx_atual)
+
+            with col_btn_status:
+                st.write("") # Espaçamento para alinhar o botão
+                st.write("")
+                if st.button("Atualizar Status", use_container_width=True):
+                    atualizar_status_os(id_os_selecionada, novo_status)
+                    st.rerun() # Recarrega a tela instantaneamente
         
         st.divider()
         
@@ -226,7 +271,7 @@ with aba4:
     if not ordens:
         st.warning("Nenhuma Ordem de Serviço cadastrada.")
     else:
-        opcoes_os = {f"OS nº {o[0]} - {o[1]} (Solicitada em: {o[2]})": o[0] for o in ordens}
+        opcoes_os = {f"OS nº {o[0]} - {o[1]} [{o[3]}]": o[0] for o in ordens}
         os_doc_selecionada = st.selectbox("Selecione a Ordem de Serviço para emissão:", list(opcoes_os.keys()), key="doc_os")
         id_os_doc = opcoes_os[os_doc_selecionada]
         

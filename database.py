@@ -1,7 +1,36 @@
 import sqlite3
 import pandas as pd
 import io
+import math
+import re
 from fpdf import FPDF
+
+def sanitizar_texto(texto):
+    """Converte e limpa caracteres Unicode incompatíveis com a codificação Latin-1 padrão do FPDF."""
+    if texto is None:
+        return ""
+    if not isinstance(texto, str):
+        texto = str(texto)
+        
+    substituicoes = {
+        'Ω': 'Ohm',
+        '≤': '<=',
+        '≥': '>=',
+        '–': '-',
+        '—': '-',
+        '“': '"',
+        '”': '"',
+        '‘': "'",
+        '’': "'",
+        '•': '*',
+        '…': '...',
+        'µ': 'u',
+    }
+    for orig, sub in substituicoes.items():
+        texto = texto.replace(orig, sub)
+        
+    return texto.encode('latin-1', 'replace').decode('latin-1')
+
 
 def criar_tabelas():
     """Cria a estrutura de tabelas no banco de dados SQLite, caso não existam."""
@@ -40,9 +69,15 @@ def criar_tabelas():
             FOREIGN KEY (id_os) REFERENCES ordens_servico (id)
         )
     """)
+    cursor.execute("PRAGMA table_info(ordens_servico)")
+    colunas_os = [col[1] for col in cursor.fetchall()]
+
+    if 'status' not in colunas_os:
+        cursor.execute("ALTER TABLE ordens_servico ADD COLUMN status TEXT DEFAULT 'Em Planejamento'")
     
     conexao.commit()
     conexao.close()
+
 
 def cadastrar_cliente(razao_social, cnpj, endereco, contato):
     try:
@@ -58,6 +93,7 @@ def cadastrar_cliente(razao_social, cnpj, endereco, contato):
     except sqlite3.IntegrityError:
         return False
 
+
 def listar_clientes():
     conexao = sqlite3.connect("pre_amostragem.db")
     cursor = conexao.cursor()
@@ -65,6 +101,7 @@ def listar_clientes():
     clientes = cursor.fetchall()
     conexao.close()
     return clientes
+
 
 def criar_ordem_servico(id_cliente, data_solicitacao, legislacao_aplicavel, laboratorio_destino):
     conexao = sqlite3.connect("pre_amostragem.db")
@@ -78,11 +115,12 @@ def criar_ordem_servico(id_cliente, data_solicitacao, legislacao_aplicavel, labo
     conexao.close()
     return id_os
 
+
 def listar_ordens_servico():
     conexao = sqlite3.connect("pre_amostragem.db")
     cursor = conexao.cursor()
     cursor.execute("""
-        SELECT os.id, c.razao_social, os.data_solicitacao
+        SELECT os.id, c.razao_social, os.data_solicitacao, os.status
         FROM ordens_servico os
         JOIN clientes c ON os.id_cliente = c.id
         ORDER BY os.id DESC
@@ -91,17 +129,25 @@ def listar_ordens_servico():
     conexao.close()
     return ordens
 
-import re
+
+def atualizar_status_os(id_os, novo_status):
+    """Atualiza o status de uma Ordem de Serviço específica."""
+    conexao = sqlite3.connect("pre_amostragem.db")
+    cursor = conexao.cursor()
+    cursor.execute("""
+        UPDATE ordens_servico 
+        SET status = ? 
+        WHERE id = ?
+    """, (novo_status, id_os))
+    conexao.commit()
+    conexao.close()
+
 
 def cadastrar_pontos_lote(id_os, quantidade_pontos, matriz, parametros):
-    """
-    Cadastra múltiplos pontos de amostragem de uma única vez para uma OS,
-    aplicando a mesma matriz e a mesma lista de parâmetros a todos eles.
-    """
+    """Cadastra múltiplos pontos de amostragem de uma única vez para uma OS."""
     conexao = sqlite3.connect("pre_amostragem.db")
     cursor = conexao.cursor()
     
-    # Identifica o maior sequencial existente para não duplicar códigos
     cursor.execute("SELECT codigo_amostra FROM pontos_amostra WHERE id_os = ?", (id_os,))
     codigos_existentes = cursor.fetchall()
     
@@ -117,7 +163,6 @@ def cadastrar_pontos_lote(id_os, quantidade_pontos, matriz, parametros):
             except ValueError:
                 continue
                 
-    # Insere sequencialmente a quantidade solicitada de pontos
     for i in range(1, quantidade_pontos + 1):
         num_ponto = maior_sequencial + i
         codigo_amostra = f"AM-OS{id_os}-P{num_ponto}"
@@ -130,6 +175,7 @@ def cadastrar_pontos_lote(id_os, quantidade_pontos, matriz, parametros):
         
     conexao.commit()
     conexao.close()
+
 
 def listar_pontos_por_os(id_os):
     conexao = sqlite3.connect("pre_amostragem.db")
@@ -144,12 +190,14 @@ def listar_pontos_por_os(id_os):
     conexao.close()
     return pontos
 
+
 def deletar_ponto_amostra(id_ponto):
     conexao = sqlite3.connect("pre_amostragem.db")
     cursor = conexao.cursor()
     cursor.execute("DELETE FROM pontos_amostra WHERE id = ?", (id_ponto,))
     conexao.commit()
     conexao.close()
+
 
 def atualizar_ponto_amostra(id_ponto, identificacao_ponto, matriz, parametros):
     """Atualiza as informações de um ponto de amostragem no banco de dados."""
@@ -164,26 +212,240 @@ def atualizar_ponto_amostra(id_ponto, identificacao_ponto, matriz, parametros):
     conexao.close()
 
 
-# --- MÓDULO DE EMISSÃO DE PDF COM ALINHAMENTO CORRIGIDO ---
+# --- MÓDULO DE EMISSÃO DE PDF (FORMULÁRIOS FM 034 AM E FM 037 AM) ---
 
-class PDF_Cadeia_Custodia(FPDF):
+class PDF_FM034_AM(FPDF):
+    """Classe geradora da Ficha de Cadeia de Custódia - FM 034 AM"""
+    def __init__(self, num_cc=""):
+        super().__init__(orientation='P', unit='mm', format='A4')
+        self.num_cc = sanitizar_texto(num_cc)
+
     def header(self):
-        self.set_font("Arial", "B", 13)
-        self.cell(0, 8, "FICHA DE CAMPO E CADEIA DE CUSTÓDIA", border=0, ln=1, align="C")
-        self.set_font("Arial", "I", 8)
-        self.cell(0, 4, "Sistema de Gestão de Pré-Amostragem Ambiental", border=0, ln=1, align="C")
-        self.ln(4)
+        self.set_font("Arial", "B", 8)
+        
+        # Coluna 1: Título
+        self.set_xy(10, 10)
+        self.cell(110, 12, "", border=1)
+        self.set_xy(12, 11)
+        self.cell(106, 4, sanitizar_texto("CADEIA DE CUSTÓDIA"), border=0, align="C", ln=1)
+        self.set_font("Arial", "", 6.5)
+        self.cell(106, 3, sanitizar_texto("(ÁGUA BRUTA, TRATADA E RESIDUÁRIA E EFLUENTE LÍQUIDO)"), border=0, align="C", ln=1)
+        
+        # Coluna 2: Controle de Documento
+        self.set_xy(120, 10)
+        self.cell(45, 12, "", border=1)
+        self.set_xy(121, 11)
+        self.cell(43, 3.5, "FM 034 AM", border=0, align="C", ln=1)
+        self.cell(43, 3, sanitizar_texto("Elaborado por: SG|AM"), border=0, align="C", ln=1)
+        self.cell(43, 3, sanitizar_texto("Aprovado por: GT"), border=0, align="C", ln=1)
+        
+        # Coluna 3: Revisão e Número da CC
+        self.set_xy(165, 10)
+        self.cell(35, 12, "", border=1)
+        self.set_xy(166, 11)
+        self.cell(33, 3.5, "Data: 01/07/2025", border=0, align="C", ln=1)
+        self.cell(33, 3, sanitizar_texto("Revisão: 01"), border=0, align="C", ln=1)
+        self.set_font("Arial", "B", 7)
+        self.cell(33, 3.5, sanitizar_texto(f"Cadeia N°: {self.num_cc}"), border=0, align="C", ln=1)
+        
+        self.ln(3)
 
     def footer(self):
         self.set_y(-15)
-        self.set_font("Arial", "I", 8)
-        self.cell(0, 10, f"Página {self.page_no()}/{{nb}}", align="C")
+        self.set_font("Arial", "", 5.5)
+        legenda = sanitizar_texto("Legenda: ACH-Água para Consumo; ASP-Água Superficial; ASB-Água Subterrânea; EFL-Efluente Líquido; PC-Proposta Comercial; OS-Ordem de Serviço.")
+        self.cell(150, 4, legenda, border=0, align="L")
+        self.set_font("Arial", "I", 7)
+        self.cell(40, 4, sanitizar_texto(f"Página {self.page_no()}/{{nb}}"), border=0, align="R")
 
-
-import math
 
 def gerar_pdf_cadeia_custodia(id_os):
-    """Gera a Ficha de Cadeia de Custódia com tabelas em branco para registro in loco."""
+    """Gera a Ficha de Cadeia de Custódia conforme o modelo oficial FM 034 AM."""
+    conexao = sqlite3.connect("pre_amostragem.db")
+    cursor = conexao.cursor()
+    
+    cursor.execute("""
+        SELECT os.id, c.razao_social, c.cnpj, c.endereco, c.contato, 
+               os.data_solicitacao, os.legislacao_aplicavel, os.laboratorio_destino, c.id
+        FROM ordens_servico os
+        JOIN clientes c ON os.id_cliente = c.id
+        WHERE os.id = ?
+    """, (id_os,))
+    dados_os = cursor.fetchone()
+    
+    cursor.execute("""
+        SELECT codigo_amostra, identificacao_ponto, matriz, parametros
+        FROM pontos_amostra
+        WHERE id_os = ?
+        ORDER BY id ASC
+    """, (id_os,))
+    pontos = cursor.fetchall()
+    conexao.close()
+    
+    if not dados_os:
+        return None
+
+    num_cc = f"CC-{dados_os[0]:04d}"
+    pdf = PDF_FM034_AM(num_cc=num_cc)
+    pdf.alias_nb_pages()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    
+    # Bloco 1: Identificação do Empreendimento
+    pdf.set_font("Arial", "B", 7.5)
+    pdf.set_fill_color(220, 220, 220)
+    pdf.cell(190, 4.5, sanitizar_texto("IDENTIFICAÇÃO DO EMPREENDIMENTO"), border=1, ln=1, align="C", fill=True)
+    
+    pdf.set_font("Arial", "", 7)
+    pdf.cell(120, 4.5, sanitizar_texto(f"Empreendimento: {dados_os[1][:60]}"), border=1)
+    pdf.cell(70, 4.5, sanitizar_texto(f"Cód. do Cliente: CLI-{dados_os[8]:03d}"), border=1, ln=1)
+    pdf.cell(120, 4.5, sanitizar_texto(f"Endereço: {dados_os[3][:60]}"), border=1)
+    pdf.cell(70, 4.5, sanitizar_texto("PC N°: -"), border=1, ln=1)
+    pdf.cell(120, 4.5, sanitizar_texto("Ponto de Referência: Local da Amostragem"), border=1)
+    pdf.cell(70, 4.5, sanitizar_texto(f"Responsável: {dados_os[4][:35]}"), border=1, ln=1)
+    pdf.cell(120, 4.5, sanitizar_texto(f"Plano de Amostragem: PA-{dados_os[0]:04d}"), border=1)
+    pdf.cell(70, 4.5, sanitizar_texto(f"OS N°: OS-{dados_os[0]:04d}"), border=1, ln=1)
+    
+    pdf.ln(2)
+
+    # Bloco 2: Identificações da Amostragem
+    pdf.set_font("Arial", "B", 7.5)
+    pdf.cell(190, 4.5, sanitizar_texto("IDENTIFICAÇÕES DA AMOSTRAGEM"), border=1, ln=1, align="C", fill=True)
+    pdf.set_font("Arial", "I", 6.5)
+    pdf.cell(190, 4, sanitizar_texto("Método de Amostragem: SMEWW, 24ª ed. - 1060 - Coleta e Preservação de Amostras"), border="LRB", ln=1)
+    
+    pdf.set_font("Arial", "B", 6.5)
+    pdf.cell(22, 5, sanitizar_texto("Cód. Amostra"), border=1, align="C")
+    pdf.cell(38, 5, sanitizar_texto("Identificação"), border=1, align="C")
+    pdf.cell(35, 5, sanitizar_texto("Localização"), border=1, align="C")
+    pdf.cell(18, 5, sanitizar_texto("Matriz"), border=1, align="C")
+    pdf.cell(22, 5, sanitizar_texto("Data/Hora"), border=1, align="C")
+    pdf.cell(40, 5, sanitizar_texto("Preservação/Acondic."), border=1, align="C")
+    pdf.cell(15, 5, sanitizar_texto("Qt. Frascos"), border=1, align="C", ln=1)
+    
+    pdf.set_font("Arial", "", 6.5)
+    num_linhas = max(len(pontos), 5)
+    for i in range(num_linhas):
+        if i < len(pontos):
+            cod, ident, mat = pontos[i][0], pontos[i][1], pontos[i][2]
+        else:
+            cod, ident, mat = "", "", ""
+            
+        pdf.cell(22, 4.5, sanitizar_texto(cod), border=1, align="C")
+        pdf.cell(38, 4.5, sanitizar_texto(ident[:25]), border=1, align="L")
+        pdf.cell(35, 4.5, "", border=1)
+        pdf.cell(18, 4.5, sanitizar_texto(mat[:10]), border=1, align="C")
+        pdf.cell(22, 4.5, "__/__ __:__", border=1, align="C")
+        pdf.cell(40, 4.5, sanitizar_texto("Resfriado <= 6°C / Pres. Quím."), border=1, align="L")
+        pdf.cell(15, 4.5, "", border=1, ln=1)
+
+    pdf.ln(2)
+
+    # Bloco 3: Medições in loco
+    pdf.set_font("Arial", "B", 7.5)
+    pdf.cell(190, 4.5, sanitizar_texto("MEDIÇÕES IN LOCO"), border=1, ln=1, align="C", fill=True)
+    
+    params_in_loco = [
+        "pH",
+        "Temperatura da Amostra (°C)",
+        "Condutividade Elétrica (uS/cm)",
+        "Oxigênio Dissolvido (ppm/%)",
+        "Sólidos Totais Dissolvidos (ppm)",
+        "Salinidade (ppt/%)",
+        "Resistividade (Ohm cm/KOhm cm)",
+        "Potencial de Óxido/Redução (mV)"
+    ]
+    
+    pdf.set_font("Arial", "B", 6.5)
+    pdf.cell(52, 4.5, sanitizar_texto("Parâmetros"), border=1, align="C")
+    for col in range(1, 7):
+        pdf.cell(23, 4.5, f"Ponto {col}", border=1, align="C")
+    pdf.ln(4.5)
+    
+    pdf.set_font("Arial", "", 6.5)
+    for p_name in params_in_loco:
+        pdf.cell(52, 4, sanitizar_texto(p_name), border=1, align="L")
+        for _ in range(6):
+            pdf.cell(23, 4, "", border=1)
+        pdf.ln(4)
+        
+    pdf.set_font("Arial", "", 6.5)
+    pdf.cell(95, 4.5, sanitizar_texto("Chuva nas Últimas 24 hrs:  (  ) Sim   (  ) Não"), border=1)
+    pdf.cell(95, 4.5, sanitizar_texto("Temp. Ar °C: ______ | Umidade (%): ______ | Pressão: ______"), border=1, ln=1)
+    pdf.cell(190, 6, sanitizar_texto("Observações: "), border=1, ln=1)
+
+    pdf.ln(2)
+
+    # Bloco 4: Recepção e Inspeção
+    pdf.set_font("Arial", "B", 7.5)
+    pdf.cell(190, 4.5, sanitizar_texto("RECEPÇÃO E INSPEÇÃO DA AMOSTRA"), border=1, ln=1, align="C", fill=True)
+    
+    pdf.set_font("Arial", "", 6.5)
+    pdf.cell(95, 4.5, sanitizar_texto("Responsável Transporte:  (  ) Cliente   (  ) Soludy"), border=1)
+    pdf.cell(95, 4.5, sanitizar_texto("Desvio?  (  ) Sim  (  ) Não   | Se sim, qual? _________________"), border=1, ln=1)
+    pdf.cell(190, 4.5, sanitizar_texto("Envio para Ensaio:  (  ) Físico-Químico   (  ) Microbiológico"), border=1, ln=1)
+    
+    pdf.ln(3)
+
+    # Assinaturas
+    pdf.set_font("Arial", "", 6.5)
+    y_ass = pdf.get_y()
+    
+    pdf.line(10, y_ass + 5, 65, y_ass + 5)
+    pdf.set_xy(10, y_ass + 5.5)
+    pdf.cell(55, 3, "AMOSTRADOR", border=0, align="C")
+    
+    pdf.line(75, y_ass + 5, 130, y_ass + 5)
+    pdf.set_xy(75, y_ass + 5.5)
+    pdf.cell(55, 3, sanitizar_texto("CIENTE DA COLETA"), border=0, align="C")
+    
+    pdf.line(140, y_ass + 5, 195, y_ass + 5)
+    pdf.set_xy(140, y_ass + 5.5)
+    pdf.cell(55, 3, sanitizar_texto("RECEBIDO PELO LAB / DATA"), border=0, align="C")
+
+    return bytes(pdf.output())
+
+
+class PDF_FM037_AM(FPDF):
+    """Classe geradora do Plano de Amostragem - FM 037 AM"""
+    def __init__(self, num_pa=""):
+        super().__init__(orientation='P', unit='mm', format='A4')
+        self.num_pa = sanitizar_texto(num_pa)
+
+    def header(self):
+        self.set_font("Arial", "B", 8)
+        
+        self.set_xy(10, 10)
+        self.cell(110, 12, "", border=1)
+        self.set_xy(12, 11)
+        self.cell(106, 4, sanitizar_texto("PLANO DE AMOSTRAGEM DE ÁGUAS, EFLUENTES,"), border=0, align="C", ln=1)
+        self.cell(106, 4, sanitizar_texto("SOLOS, SEDIMENTOS E RESÍDUO"), border=0, align="C", ln=1)
+        
+        self.set_xy(120, 10)
+        self.cell(45, 12, "", border=1)
+        self.set_xy(121, 11)
+        self.cell(43, 3.5, "FM 037 AM", border=0, align="C", ln=1)
+        self.cell(43, 3, sanitizar_texto("Elaborado por: AM"), border=0, align="C", ln=1)
+        self.cell(43, 3, sanitizar_texto("Aprovado por: SG"), border=0, align="C", ln=1)
+        
+        self.set_xy(165, 10)
+        self.cell(35, 12, "", border=1)
+        self.set_xy(166, 11)
+        self.cell(33, 3.5, "Data: 18/05/2026", border=0, align="C", ln=1)
+        self.cell(33, 3, sanitizar_texto("Revisão: 01"), border=0, align="C", ln=1)
+        self.set_font("Arial", "B", 7)
+        self.cell(33, 3.5, sanitizar_texto(f"Plano N°: {self.num_pa}"), border=0, align="C", ln=1)
+        
+        self.ln(3)
+
+    def footer(self):
+        self.set_y(-12)
+        self.set_font("Arial", "", 6)
+        self.cell(0, 4, sanitizar_texto("Tv. São Roque, 98 - Cruzeiro - Belém/PA | Contato: (91) 98203-6889 | gestao@soludy.com.br"), border=0, align="C")
+
+
+def gerar_pdf_plano_amostragem(id_os):
+    """Gera o PDF do Plano de Amostragem oficial FM 037 AM."""
     conexao = sqlite3.connect("pre_amostragem.db")
     cursor = conexao.cursor()
     
@@ -208,111 +470,80 @@ def gerar_pdf_cadeia_custodia(id_os):
     if not dados_os:
         return None
 
-    pdf = PDF_Cadeia_Custodia()
+    num_pa = f"PA-{dados_os[0]:04d}"
+    pdf = PDF_FM037_AM(num_pa=num_pa)
     pdf.alias_nb_pages()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
     
-    # Cabeçalho da Ordem de Serviço
-    pdf.set_font("Arial", "B", 9)
-    pdf.set_fill_color(220, 220, 220)
-    pdf.cell(0, 6, f"ORDEM DE SERVIÇO Nº: {dados_os[0]}", border=1, ln=1, fill=True)
+    pdf.set_font("Arial", "", 7.5)
     
-    pdf.set_font("Arial", "", 8)
-    pdf.cell(100, 5, f"Cliente: {dados_os[1]}", border=1)
-    pdf.cell(90, 5, f"CNPJ/CPF: {dados_os[2]}", border=1, ln=1)
+    pdf.cell(190, 5, sanitizar_texto(f"Empreendimento: {dados_os[1]}"), border=1, ln=1)
+    pdf.cell(120, 5, sanitizar_texto(f"Local de Amostragem: {dados_os[3]}"), border=1)
+    pdf.cell(70, 5, sanitizar_texto(f"Contato: {dados_os[4]}"), border=1, ln=1)
     
-    pdf.cell(190, 5, f"Endereço de Coleta: {dados_os[3]}", border=1, ln=1)
-    pdf.cell(100, 5, f"Contato: {dados_os[4]}", border=1)
-    pdf.cell(90, 5, f"Data da Solicitação: {dados_os[5]}", border=1, ln=1)
+    pdf.ln(2)
     
-    pdf.cell(110, 5, f"Legislação: {dados_os[6]}", border=1)
-    pdf.cell(80, 5, f"Destino: {dados_os[7]}", border=1, ln=1)
+    pdf.set_font("Arial", "B", 7.5)
+    pdf.cell(190, 4.5, sanitizar_texto("1. Objetivo do Serviço"), border=1, ln=1, fill=True)
+    pdf.set_font("Arial", "", 7)
+    pdf.cell(190, 4.5, sanitizar_texto("Amostragem ambiental e caracterização analítica para controle de qualidade e conformidade normativa."), border="LRB", ln=1)
     
-    pdf.ln(4)
+    pdf.set_font("Arial", "B", 7.5)
+    pdf.cell(190, 4.5, sanitizar_texto("2. Especificações do Cliente e Requisitos Legais"), border=1, ln=1, fill=True)
+    pdf.set_font("Arial", "", 7)
+    pdf.cell(190, 4.5, sanitizar_texto(f"Legislação de Referência: {dados_os[6]}"), border="LRB", ln=1)
     
-    # TABELA 1: Identificação dos Pontos de Coleta (Em Branco para o Campo)
-    pdf.set_font("Arial", "B", 8)
-    pdf.cell(20, 7, "Código", border=1, align="C")
-    pdf.cell(35, 7, "Identificação", border=1, align="C")
-    pdf.cell(45, 7, "Matriz (ASP, ASB, etc.)", border=1, align="C")
-    pdf.cell(25, 7, "Data", border=1, align="C")
-    pdf.cell(20, 7, "Hora", border=1, align="C")
-    pdf.cell(25, 7, "Localização", border=1, align="C")
-    pdf.cell(20, 7, "Qtd Frascos", border=1, align="C", ln=1)
+    pdf.ln(2)
     
-    pdf.set_font("Arial", "", 8)
+    pdf.set_font("Arial", "B", 7.5)
+    pdf.cell(190, 4.5, sanitizar_texto("3. Matrizes e Quantidade de Pontos Planejados"), border=1, ln=1, fill=True)
+    pdf.set_font("Arial", "", 7)
+    pdf.cell(190, 4.5, sanitizar_texto(f"Quantidade Total de Pontos Configurados nesta OS: {len(pontos)} ponto(s)"), border="LRB", ln=1)
     
-    # Se existirem pontos cadastrados na OS, imprime linhas pré-preenchidas com os códigos
-    num_linhas_tabela1 = max(len(pontos), 6)
+    pdf.ln(2)
     
-    for i in range(num_linhas_tabela1):
-        if i < len(pontos):
-            cod = pontos[i][0]
-            ident = pontos[i][1]
-            mat = pontos[i][2]
-        else:
-            cod, ident, mat = "", "", ""
-            
-        pdf.cell(20, 6, cod, border=1, align="C")
-        pdf.cell(35, 6, ident, border=1, align="L")
-        pdf.cell(45, 6, mat, border=1, align="C")
-        pdf.cell(25, 6, "___ / ___ / ____", border=1, align="C")
-        pdf.cell(20, 6, "__ : __", border=1, align="C")
-        pdf.cell(25, 6, "", border=1)
-        pdf.cell(20, 6, "", border=1, ln=1)
+    pdf.set_font("Arial", "B", 7.5)
+    pdf.cell(190, 4.5, sanitizar_texto("4. Definição dos Pontos de Amostragem e Parâmetros Requeridos"), border=1, ln=1, fill=True)
+    
+    pdf.set_font("Arial", "B", 6.5)
+    pdf.cell(25, 5, sanitizar_texto("Código"), border=1, align="C")
+    pdf.cell(45, 5, sanitizar_texto("Identificação"), border=1, align="C")
+    pdf.cell(20, 5, sanitizar_texto("Matriz"), border=1, align="C")
+    pdf.cell(100, 5, sanitizar_texto("Parâmetros Analíticos Requeridos"), border=1, align="C", ln=1)
+    
+    pdf.set_font("Arial", "", 6.5)
+    for p in pontos:
+        cod, ident, mat, param = str(p[0]), str(p[1]), str(p[2]), str(p[3])
         
-    pdf.ln(5)
-    
-    # TABELA 2: Matriz de Medição de Parâmetros In Loco (Pontos 1 a 6)
-    lista_parametros_padrao = [
-        "pH",
-        "Condutividade Elétrica",
-        "Salinidade",
-        "Sólidos Totais Dissolvidos",
-        "Potencial de Oxidação",
-        "Temperatura"
-    ]
-    
-    # Se houver parâmetros específicos cadastrados na OS, utiliza-os
-    if pontos and pontos[0][3]:
-        params_os = [p.strip() for p in pontos[0][3].split(",")]
-        if len(params_os) > 0:
-            lista_parametros_padrao = params_os
+        largura_text = pdf.get_string_width(sanitizar_texto(param))
+        linhas = math.ceil(largura_text / 96)
+        altura = max(5.0, linhas * 3.5 + 1.5)
+        
+        x_init, y_init = pdf.get_x(), pdf.get_y()
+        
+        pdf.cell(25, altura, sanitizar_texto(cod), border=1, align="C")
+        pdf.cell(45, altura, sanitizar_texto(ident[:28]), border=1, align="L")
+        pdf.cell(20, altura, sanitizar_texto(mat[:10]), border=1, align="C")
+        
+        x_param = pdf.get_x()
+        pdf.cell(100, altura, "", border=1)
+        pdf.set_xy(x_param + 1, y_init + 1)
+        pdf.multi_cell(98, 3, sanitizar_texto(param), border=0, align="L")
+        pdf.set_xy(x_init, y_init + altura)
 
-    pdf.set_font("Arial", "B", 8)
-    pdf.cell(52, 6, "Parâmetros", border=1, align="C", fill=True)
-    for num_col in range(1, 7):
-        pdf.cell(23, 6, str(num_col), border=1, align="C", fill=True)
-    pdf.ln(6)
-    
-    pdf.set_font("Arial", "", 8)
-    for param in lista_parametros_padrao:
-        pdf.cell(52, 6, param[:30], border=1, align="L")
-        for _ in range(6):
-            pdf.cell(23, 6, "", border=1)
-        pdf.ln(6)
-        
-    pdf.ln(6)
-    
-    # Seção de Assinaturas
-    pdf.set_font("Arial", "B", 8)
-    pdf.cell(0, 5, "REGISTRO DE CAMPO E RESPONSABILIDADE DA COLETA", border=0, ln=1)
-    pdf.ln(5)
-    
-    pdf.set_font("Arial", "", 8)
-    pdf.cell(90, 4, "________________________________________", border=0, ln=0, align="C")
-    pdf.cell(10, 4, "", border=0, ln=0)
-    pdf.cell(90, 4, "________________________________________", border=0, ln=1, align="C")
-    
-    pdf.cell(90, 4, "Técnico de Amostragem (Assinatura)", border=0, ln=0, align="C")
-    pdf.cell(10, 4, "", border=0, ln=0)
-    pdf.cell(90, 4, "Recebido pelo Laboratório (Assinatura)", border=0, ln=1, align="C")
-    
+    pdf.ln(2)
+
+    pdf.set_font("Arial", "B", 7.5)
+    pdf.cell(190, 4.5, sanitizar_texto("5. Programa de Garantia da Validade dos Resultados e Preservação"), border=1, ln=1, fill=True)
+    pdf.set_font("Arial", "", 7)
+    pdf.cell(190, 4.5, sanitizar_texto(f"Destino das Amostras: {dados_os[7]} | Preservação: Resfriamento <= 6°C e adição de reagentes específicos."), border="LRB", ln=1)
+
     return bytes(pdf.output())
 
 
 def gerar_excel_ordem_servico(id_os):
+    """Gera a planilha Excel com o resumo da Ordem de Serviço e pontos."""
     conexao = sqlite3.connect("pre_amostragem.db")
     cursor = conexao.cursor()
     
@@ -353,102 +584,3 @@ def gerar_excel_ordem_servico(id_os):
         worksheet["A4"] = f"Legislação: {dados_os[6]} | Destino: {dados_os[7]}"
         
     return buffer.getvalue()
-
-def gerar_pdf_plano_amostragem(id_os):
-    """Gera o PDF do Plano de Amostragem contendo as diretrizes e parâmetros do serviço."""
-    conexao = sqlite3.connect("pre_amostragem.db")
-    cursor = conexao.cursor()
-    
-    cursor.execute("""
-        SELECT os.id, c.razao_social, c.cnpj, c.endereco, c.contato, 
-               os.data_solicitacao, os.legislacao_aplicavel, os.laboratorio_destino
-        FROM ordens_servico os
-        JOIN clientes c ON os.id_cliente = c.id
-        WHERE os.id = ?
-    """, (id_os,))
-    dados_os = cursor.fetchone()
-    
-    cursor.execute("""
-        SELECT codigo_amostra, identificacao_ponto, matriz, parametros
-        FROM pontos_amostra
-        WHERE id_os = ?
-        ORDER BY id ASC
-    """, (id_os,))
-    pontos = cursor.fetchall()
-    conexao.close()
-    
-    if not dados_os:
-        return None
-
-    pdf = PDF_Cadeia_Custodia()  # Utiliza a mesma classe base de PDF
-    pdf.alias_nb_pages()
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    
-    # Título do Documento
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 6, "PLANO DE AMOSTRAGEM AMBIENTAL", border=0, ln=1, align="C")
-    pdf.ln(3)
-    
-    # Tabela de Informações da OS
-    pdf.set_font("Arial", "B", 9)
-    pdf.set_fill_color(220, 220, 220)
-    pdf.cell(0, 6, f"ORDEM DE SERVIÇO Nº: {dados_os[0]}", border=1, ln=1, fill=True)
-    
-    pdf.set_font("Arial", "", 8)
-    pdf.cell(100, 5, f"Cliente: {dados_os[1]}", border=1)
-    pdf.cell(90, 5, f"CNPJ/CPF: {dados_os[2]}", border=1, ln=1)
-    
-    pdf.cell(190, 5, f"Endereço de Coleta: {dados_os[3]}", border=1, ln=1)
-    pdf.cell(100, 5, f"Contato: {dados_os[4]}", border=1)
-    pdf.cell(90, 5, f"Data da Solicitação: {dados_os[5]}", border=1, ln=1)
-    
-    pdf.cell(110, 5, f"Legislação: {dados_os[6]}", border=1)
-    pdf.cell(80, 5, f"Destino: {dados_os[7]}", border=1, ln=1)
-    
-    pdf.ln(4)
-    
-    # Tabela de Pontos e Parâmetros
-    pdf.set_font("Arial", "B", 9)
-    pdf.cell(0, 6, "PONTOS PLANEJADOS E PARÂMETROS REQUERIDOS", border=1, ln=1, fill=True)
-    
-    pdf.set_font("Arial", "B", 8)
-    pdf.cell(25, 6, "Código", border=1, align="C")
-    pdf.cell(45, 6, "Identificação", border=1, align="C")
-    pdf.cell(20, 6, "Matriz", border=1, align="C")
-    pdf.cell(100, 6, "Parâmetros Requeridos", border=1, align="C", ln=1)
-    
-    pdf.set_font("Arial", "", 8)
-    
-    for p in pontos:
-        cod, ident, mat, param = str(p[0]), str(p[1]), str(p[2]), str(p[3])
-        largura_col_param = 100
-        
-        largura_texto = pdf.get_string_width(param)
-        linhas_estimadas = math.ceil(largura_texto / (largura_col_param - 4))
-        if linhas_estimadas < 1:
-            linhas_estimadas = 1
-            
-        altura_linha_texto = 4.5
-        altura_total = max(7.0, linhas_estimadas * altura_linha_texto + 2.5)
-        
-        x_inicial = pdf.get_x()
-        y_inicial = pdf.get_y()
-        
-        pdf.cell(25, altura_total, "", border=1)
-        pdf.cell(45, altura_total, "", border=1)
-        pdf.cell(20, altura_total, "", border=1)
-        pdf.cell(100, altura_total, "", border=1)
-        
-        pdf.set_xy(x_inicial, y_inicial)
-        pdf.cell(25, altura_total, cod, border=0, align="C")
-        pdf.cell(45, altura_total, ident[:25], border=0, align="L")
-        pdf.cell(20, altura_total, mat[:10], border=0, align="C")
-        
-        x_param = pdf.get_x()
-        pdf.set_xy(x_param + 1, y_inicial + 1.5)
-        pdf.multi_cell(largura_col_param - 2, altura_linha_texto, param, border=0, align="L")
-        
-        pdf.set_xy(x_inicial, y_inicial + altura_total)
-        
-    return bytes(pdf.output())
